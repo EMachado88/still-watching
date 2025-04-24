@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sync/atomic"
 	"time"
 
 	systray "github.com/getlantern/systray"
+	"gocv.io/x/gocv"
 )
 
 var (
@@ -19,8 +21,9 @@ var (
 	}
 
 	currentDuration = timerDurations["5 minutes"]
-	monitoring      = false
+	monitoring      = true
 	timerItems      = make(map[string]*systray.MenuItem)
+	eyesDetected    atomic.Value
 )
 
 func main() {
@@ -70,11 +73,13 @@ func onReady() {
 	}()
 
 	for label, item := range timerItems {
+		lbl := label
+		itm := item
 		go func() {
 			for {
-				<-item.ClickedCh
-				currentDuration = timerDurations[label]
-				fmt.Println("Timer set to:", label)
+				<-itm.ClickedCh
+				currentDuration = timerDurations[lbl]
+				fmt.Println("Timer set to:", lbl)
 				updateTimerChecks()
 			}
 		}()
@@ -98,14 +103,65 @@ func onExit() {
 
 func startMonitoring() {
 	fmt.Println("[Monitoring started for", currentDuration, "]")
-	// Placeholder: Webcam detection + overlay logic here
+	eyesDetected.Store(true)
+
+	classifier := gocv.NewCascadeClassifier()
+	defer classifier.Close()
+	if !classifier.Load("./assets/haarcascade_eye.xml") {
+		fmt.Println("Error loading cascade file")
+		return
+	}
+
+	webcam, err := gocv.OpenVideoCapture(0)
+	if err != nil {
+		fmt.Println("Error opening webcam:", err)
+		return
+	}
+	defer webcam.Close()
+
+	img := gocv.NewMat()
+	defer img.Close()
+
+	inactivityTimer := time.NewTimer(currentDuration)
+	defer inactivityTimer.Stop()
+
+	checkInterval := time.Second
+detectionLoop:
+	for monitoring {
+		if ok := webcam.Read(&img); !ok || img.Empty() {
+			continue
+		}
+		eyes := classifier.DetectMultiScale(img)
+		if len(eyes) == 0 {
+			fmt.Println("No eyes detected")
+			if inactivityTimer.Stop() {
+				inactivityTimer.Reset(currentDuration)
+			}
+			select {
+			case <-inactivityTimer.C:
+				fmt.Println("No eyes for", currentDuration, ", suspending...")
+				suspendSystem()
+				break detectionLoop
+			default:
+			}
+		} else {
+			fmt.Println("Eyes detected")
+			inactivityTimer.Reset(currentDuration)
+		}
+		time.Sleep(checkInterval)
+	}
+
+	fmt.Println("Monitoring stopped.")
 }
 
 func stopMonitoring() {
 	fmt.Println("[Monitoring stopped]")
-	// Placeholder: stop webcam + clear overlays
+	monitoring = false
 }
 
 func suspendSystem() {
-	exec.Command("systemctl", "suspend").Run()
+	err := exec.Command("systemctl", "suspend").Run()
+	if err != nil {
+		fmt.Println("Error suspending system:", err)
+	}
 }
